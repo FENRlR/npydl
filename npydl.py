@@ -95,10 +95,13 @@ class Matmul:
     def fwd(self, x, w):
         self.x = x
         self.w = w
-        return np.dot(x, w) # y = xw
+        #return np.dot(x, w) # y = xw
+        return np.matmul(x, w) # y = xw
     def bwd(self, dl):
-        dx = np.dot(dl, self.w.T) # dL/dx = dL/dy * dy/dx
-        dw = np.dot(self.x.T, dl)
+        #dx = np.dot(dl, self.w.T) # dL/dx = dL/dy * dy/dx
+        dx = np.matmul(dl, self.w.T) # dL/dx = dL/dy * dy/dx
+        #dw = np.dot(self.x.T, dl)
+        dw = np.matmul(self.x.reshape(-1, self.x.shape[-1]).T, dl.reshape(-1, dl.shape[-1]))
         return dx, dw
 
 
@@ -250,6 +253,44 @@ class RMSNorm(Mod):
         self.r.grad = np.sum(dl * self.x_hat, axis=tuple(range(dl.ndim - 1))).reshape(self.r.mat.shape) # dl/dy * x/rms -> [1, f], sums all but feat dim
         dx_hat = dl * self.r.mat
         dx = (dx_hat - self.x_hat * np.mean(dx_hat * self.x_hat, axis=-1, keepdims=True)) / self.rms
+        return dx
+
+
+class LayerNorm(Mod):
+    def __init__(self, dim, eps=1e-8):
+        super().__init__()
+        self.eps = eps
+        self.x = None
+        self.var = None
+        self.sqvar = None
+        self.mean = None
+        self.w = Parameter(1, dim, init='ones')
+        self.b = Parameter(1, dim, init='zeros')
+
+        self.mul = Matmul()
+        self.add = Matadd()
+
+    def fwd(self, x):
+        self.x = x
+        self.mean = np.mean(x, axis=-1, keepdims=True)
+        self.var = np.var(x, axis=-1, keepdims=True)
+        self.sqvar = np.sqrt(self.var+self.eps)
+        return self.add.fwd(self.mul.fwd(self.w.mat, (x-self.mean)/self.sqvar), self.b.mat)
+
+    def bwd(self, dl): # dl/dx = dl/dy * dy/dx where dy/dx = (w/(N*sqrt(var)))*(N-1-((x-mean)^2)/var)
+        N = self.x.shape[-1]
+        dl, db = self.add.bwd(dl)
+        dx, dw = self.mul.bwd(dl)
+        if self.w.grad is None:
+            self.w.grad = dw
+        else:
+            self.w.grad += dw
+        if self.b is not None:
+            if self.b.grad is None:
+                self.b.grad = db
+            else:
+                self.b.grad += db
+        dx = (dx/(N*self.sqvar)) * (N-1-(np.square(self.x-self.mean))/self.var)
         return dx
 
 

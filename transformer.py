@@ -1,5 +1,5 @@
 """
-mlp training example with MNIST
+transformer training example with MNIST
 """
 import numpy as np
 import npydl as nd

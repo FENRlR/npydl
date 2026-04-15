@@ -1,2 +1,2 @@
 # npydl
-Deep learning using numpy only
+Deep learning framework using numpy only

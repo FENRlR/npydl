@@ -99,9 +99,19 @@ class Matmul:
         return np.matmul(x, w) # y = xw
     def bwd(self, dl):
         #dx = np.dot(dl, self.w.T) # dL/dx = dL/dy * dy/dx
-        dx = np.matmul(dl, self.w.T) # dL/dx = dL/dy * dy/dx
+        #dx = np.matmul(dl, self.w.T) # dL/dx = dL/dy * dy/dx
         #dw = np.dot(self.x.T, dl)
-        dw = np.matmul(self.x.reshape(-1, self.x.shape[-1]).T, dl.reshape(-1, dl.shape[-1]))
+        #dw = np.matmul(self.x.reshape(-1, self.x.shape[-1]).T, dl.reshape(-1, dl.shape[-1]))
+
+        wT = np.swapaxes(self.w, -1, -2)
+        xT = np.swapaxes(self.x, -1, -2)
+        dx = np.matmul(dl, wT)
+        dw = np.matmul(xT, dl)
+        if self.w.ndim == 2:
+            axes = tuple(range(dw.ndim - 2))
+            if axes:
+                dw = np.sum(dw, axis=axes)
+
         return dx, dw
 
 
@@ -113,13 +123,22 @@ class Matadd:
         self.x_shape = x.shape
         self.y_shape = y.shape
         return x + y
+    def shapematch(self, grad, tgt_shape): # shape match for broadcast gradient
+        while grad.ndim > len(tgt_shape): # delete
+            grad = np.sum(grad, axis=0, keepdims=False)
+        for axis, size in enumerate(tgt_shape): # restore to tgt_shape (for the cases like [1, b])
+            if size == 1:
+                grad = np.sum(grad, axis=axis, keepdims=True)
+        return grad.reshape(tgt_shape)
     def bwd(self, dl):
-        dx = dl # dl * 1
-        dy = dl # dl * 1
+        dx = dl.copy() # dl * 1
+        dy = dl.copy() # dl * 1
         if dx.shape != self.x_shape: # for broadcasting
-            dx = np.sum(dx, axis=0, keepdims=True)
+            #dx = np.sum(dx, axis=0, keepdims=True)
+            dx = self.shapematch(dx, self.x_shape)
         if dy.shape != self.y_shape:
-            dy = np.sum(dy, axis=0, keepdims=True)
+            #dy = np.sum(dy, axis=0, keepdims=True)
+            dy = self.shapematch(dy, self.y_shape)
         return dx, dy
 
 
@@ -257,7 +276,7 @@ class RMSNorm(Mod):
 
 
 class LayerNorm(Mod):
-    def __init__(self, dim, eps=1e-8):
+    def __init__(self, dim, eps=1e-5):
         super().__init__()
         self.eps = eps
         self.x = None
@@ -267,7 +286,7 @@ class LayerNorm(Mod):
         self.w = Parameter(1, dim, init='ones')
         self.b = Parameter(1, dim, init='zeros')
 
-        self.mul = Matmul()
+        #self.mul = Matmul()
         self.add = Matadd()
 
     def fwd(self, x):
@@ -275,12 +294,18 @@ class LayerNorm(Mod):
         self.mean = np.mean(x, axis=-1, keepdims=True)
         self.var = np.var(x, axis=-1, keepdims=True)
         self.sqvar = np.sqrt(self.var+self.eps)
-        return self.add.fwd(self.mul.fwd(self.w.mat, (x-self.mean)/self.sqvar), self.b.mat)
+        return self.add.fwd((self.w.mat * (x-self.mean)/self.sqvar), self.b.mat)
 
     def bwd(self, dl): # dl/dx = dl/dy * dy/dx where dy/dx = (w/(N*sqrt(var)))*(N-1-((x-mean)^2)/var)
         N = self.x.shape[-1]
         dl, db = self.add.bwd(dl)
-        dx, dw = self.mul.bwd(dl)
+
+        #dx, dw = self.mul.bwd(dl)
+        dw = np.sum(dl * (self.x-self.mean)/self.sqvar, axis=tuple(range(len(dl.shape) - 1)), keepdims=True)
+
+        dw = dw.reshape(self.w.mat.shape)  # (1, dim)
+        db = db.reshape(self.b.mat.shape)  # (1, dim)
+
         if self.w.grad is None:
             self.w.grad = dw
         else:
@@ -290,7 +315,8 @@ class LayerNorm(Mod):
                 self.b.grad = db
             else:
                 self.b.grad += db
-        dx = (dx/(N*self.sqvar)) * (N-1-(np.square(self.x-self.mean))/self.var)
+        dx = dl * (self.w.mat/(N*self.sqvar)) * (N-1-(np.square(self.x-self.mean))/self.var)
+        #print(f"w:{self.w.shape}, b:{self.b.shape}, x:{self.x.shape}, db:{db.shape}, dw:{dw.shape}, dx:{dx.shape}")
         return dx
 
 

@@ -121,7 +121,7 @@ model = Model(in_dim=dim, hidden_dim=dim*2, requires_grad=True)
 optim = nd.Adam_W(params=model.params())
 criterion = nd.CrossEntropyLoss()
 
-_ = nd.load_ckpt(model, optim, "./model.npydl")
+_ = nd.load_ckpt(model, optim, "./mlp.npydl")
 
 for e in range(epoch):
     # train
@@ -160,4 +160,4 @@ for e in range(epoch):
     acc = pos / val_samples
     print(f"epoch {e+1} - train_loss: {tloss_avg:.4f}, val_loss: {vloss_avg:.4f}, acc: {acc:.4f}")
 
-nd.save_ckpt(model, optim, epoch, f"./model.npydl")
+nd.save_ckpt(model, optim, epoch, f"./mlp.npydl")

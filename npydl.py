@@ -447,6 +447,146 @@ class Conv2D(Mod):
         return dx
 
 
+class Transformer(Mod): # transformer block
+    def __init__(self, d_model, num_heads, d_ffn, bias=True, dtype=np.float32, requires_grad=True):
+        super().__init__()
+        self.mha = MHA(d_model, num_heads, bias=bias, dtype=dtype, requires_grad=requires_grad)
+        self.norm1 = LayerNorm(d_model)
+        self.norm2 = LayerNorm(d_model)
+        self.ffn = FFN(d_model, d_ffn, bias=bias, dtype=dtype, requires_grad=requires_grad)
+
+        self.add1 = Matadd()
+        self.add2 = Matadd()
+
+    def fwd(self, x, mask=None):
+        attn = self.mha.fwd(x, mask)
+        rsd1 = self.add1.fwd(x, attn)
+
+        y = self.norm1.fwd(rsd1)
+        y_ffn = self.ffn.fwd(y)
+
+        rsd2 = self.add2.fwd(y, y_ffn)
+        z = self.norm2.fwd(rsd2)
+        return z
+
+    def bwd(self, dl):
+        dl = self.norm2.bwd(dl)
+        dy_rsd2, dff = self.add2.bwd(dl)
+
+        dy_ffn = self.ffn.bwd(dff)
+        dy = dy_rsd2 + dy_ffn
+        dy = self.norm1.bwd(dy)
+
+        dx_rsd1, dattn = self.add1.bwd(dy)
+        dx_attn = self.mha.bwd(dattn)
+
+        dx = dx_rsd1 + dx_attn
+        return dx
+
+
+class MHA(Mod):
+    def __init__(self, d_model, num_heads=2, bias=True, dtype=np.float32, requires_grad=True):
+        super().__init__()
+        assert d_model % num_heads == 0
+        self.d_model = d_model
+        self.h = num_heads
+        self.d_head = d_model // num_heads
+
+        self.Wq = Linear(d_model, d_model, bias=bias, dtype=dtype, requires_grad=requires_grad)
+        self.Wk = Linear(d_model, d_model, bias=bias, dtype=dtype, requires_grad=requires_grad)
+        self.Wv = Linear(d_model, d_model, bias=bias, dtype=dtype, requires_grad=requires_grad)
+        self.Wo = Linear(d_model, d_model, bias=bias, dtype=dtype, requires_grad=requires_grad)
+
+        self.softmax = Softmax()
+
+        self.q = None
+        self.k = None
+        self.v = None
+        self.attn = None
+        self.scale = self.d_head ** 0.5
+
+        self.mul_qk = Matmul()
+        self.mul_av = Matmul()
+
+    def hd_split(self, x):
+        B, T, C = x.shape
+        x = x.reshape(B, T, self.h, self.d_head)
+        return x.transpose(0, 2, 1, 3)  # (B, h, T, d_head)
+
+    def hd_combine(self, x):
+        B, h, T, d = x.shape
+        x = x.transpose(0, 2, 1, 3)
+        return x.reshape(B, T, h * d)
+
+    def fwd(self, x, mask=None):
+        q = self.Wq.fwd(x)
+        k = self.Wk.fwd(x)
+        v = self.Wv.fwd(x)
+
+        self.q = self.hd_split(q)
+        self.k = self.hd_split(k)
+        self.v = self.hd_split(v)
+
+        score = self.mul_qk.fwd(self.q, self.k.transpose(0, 1, 3, 2))
+        score = score / self.scale
+        if mask is not None:
+            score += mask
+
+        self.attn = self.softmax.fwd(score)
+
+        out = self.mul_av.fwd(self.attn, self.v)
+        out = self.hd_combine(out)
+        out = self.Wo.fwd(out)
+
+        return out
+
+    def bwd(self, dl):
+        do = self.Wo.bwd(dl)
+        do = self.hd_split(do)
+
+        dattn, dv = self.mul_av.bwd(do)
+
+        dscore = self.softmax.bwd(dattn)
+        dscore /= self.scale
+
+        dq, dkt = self.mul_qk.bwd(dscore)
+        dk = dkt.transpose(0, 1, 3, 2)
+
+        dq = self.hd_combine(dq)
+        dk = self.hd_combine(dk)
+        dv = self.hd_combine(dv)
+
+        dx = self.Wq.bwd(dq)
+        dx += self.Wk.bwd(dk)
+        dx += self.Wv.bwd(dv)
+
+        return dx
+
+class FFN(Mod):
+    def __init__(self, dim, h_dim, bias=True, dtype=np.float32, requires_grad=True):
+        super().__init__()
+        self.bias = bias
+        self.dtype = dtype
+        self.requires_grad = requires_grad
+        self.in_dim = dim
+        self.h_dim = h_dim
+        self.layers = ModList(
+            Linear(self.in_dim, self.h_dim, bias=bias, dtype=dtype, requires_grad=requires_grad),
+            Relu(),
+            Linear(self.h_dim, self.in_dim, bias=bias, dtype=dtype, requires_grad=requires_grad)
+        )
+
+    def fwd(self, x): # forward
+        for layer in self.layers:
+            x = layer.fwd(x)
+        return x
+
+    def bwd(self, dl): # backward
+        for layer in reversed(self.layers):
+            dl = layer.bwd(dl)
+        return dl
+
+
 # Transform
 class Transpose(Mod):
     def __init__(self, *axis):

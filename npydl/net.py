@@ -1,0 +1,560 @@
+import numpy as np
+from . import func as fc
+from . import operator as opr
+
+# generic components
+class Parameter:
+    def __init__(self, *shape, init='xavier', dtype=np.float32, requires_grad=True):
+        self.shape = shape # [in_dim, ..., out_dim]
+        self.req_grad = requires_grad
+        self.grad = None
+        if init == 'xavier':
+            if len(shape) == 1:
+                in_dim = shape[0]
+                out_dim = shape[0]
+            elif len(shape) == 2:
+                in_dim, out_dim = shape # self.shape = (in_dim, out_dim)
+            else:
+                inter = np.prod(shape[1:-1])
+                in_dim = shape[0] * inter
+                out_dim = shape[-1] * inter
+            self.mat = fc.xavier(in_dim, out_dim).astype(dtype)
+        #if init == 'xavier':
+        #    self.mat = xavier(in_dim, out_dim).astype(dtype)
+        elif init == 'zeros':
+            self.mat = np.zeros(self.shape).astype(dtype)
+        elif init == 'ones':
+            self.mat = np.ones(self.shape).astype(dtype)
+
+
+class Mod: # generic module
+    def __init__(self):
+        self._modules_ = {}
+        self._parameters_ = {}
+
+    def __setattr__(self, name, value):
+        if isinstance(value, Mod):
+            self._modules_[name] = value
+        elif isinstance(value, Parameter):
+            self._parameters_[name] = value
+        object.__setattr__(self, name, value)
+
+    def params(self):
+        parameters = []
+        parameters += list(self._parameters_.values())
+        for m in self._modules_.values():
+            parameters += m.params()
+        return parameters
+
+    #def modval(self):
+    #    return self._modules_.values()
+
+
+# Module list
+class ModList(Mod):
+    def __init__(self, *layer):
+        super().__init__()
+        self.list = []
+        for i, j in enumerate(layer):
+            self.list.append(j)
+            setattr(self, str(i), j) # self.i = layer
+
+    def __len__(self):
+        return len(self.list)
+
+    def __getitem__(self, idx):
+        return self.list[idx]
+
+    def __iter__(self):
+        return iter(self.list)
+
+    def append(self, layer):
+        setattr(self, str(len(self.list)), layer)
+        self.list.append(layer)
+        return
+
+
+# func
+class Relu(Mod): # np.maximum(0, x)
+    def __init__(self):
+        super().__init__()
+        self.mask = None
+
+    def fwd(self, x):
+        self.mask = (x <= 0)
+        out = x.copy()
+        out[self.mask] = 0
+        return out
+
+    def bwd(self, dl):
+        dl[self.mask] = 0
+        dx = dl
+        return dx
+
+
+class Sigmoid(Mod):
+    def __init__(self):
+        super().__init__()
+        self.out = None
+
+    def fwd(self, x):
+        out = 1 / (1 + np.exp(-x))
+        self.out = out
+        return out
+
+    def bwd(self, dl):
+        dx = dl * (1.0 - self.out) * self.out
+        return dx
+
+
+class Softmax(Mod):
+    def __init__(self, axis=-1):
+        super().__init__()
+        self.axis = axis
+        self.out = None
+
+    def fwd(self, x):
+        x_rel = x - np.max(x, axis=self.axis, keepdims=True)
+        x_exp = np.exp(x_rel)
+        out = x_exp / np.sum(x_exp, axis=self.axis, keepdims=True)
+        self.out = out
+        return out
+
+    def bwd(self, dl):
+        y = self.out
+        dot = np.sum(dl * y, axis=self.axis, keepdims=True)
+        dx = y * (dl - dot)
+        return dx
+
+
+class SoftmaxWithLoss(Mod):
+    def __init__(self):
+        self.loss = None
+        self.y = None # from softmax
+        self.t = None # tlabel one-hot
+
+    def fwd(self, x, t):
+        self.t = t
+        self.y = fc.softmax(x)
+        self.loss = fc.cross_entropy_error(self.y, self.t)
+        return self.loss
+
+    def bwd(self):
+        dx = (self.y - self.t) / self.t.shape[0]
+        return dx
+
+
+class CrossEntropyLoss(Mod): # -np.sum(tgt * np.log(y + 1e-9)) / y.shape[0]
+    def __init__(self, eps=1e-9):
+        self.probs = None
+        self.labels = None
+        self.eps = eps
+
+    def fwd(self, probs, labels): # softmax output: (B, C), labels: (B,)
+        self.probs = probs
+        self.labels = labels
+
+        B = probs.shape[0]
+        loss = -np.log(probs[np.arange(B), labels] + self.eps)
+        return np.mean(loss)
+
+    def bwd(self): # dl/dprobs
+        B = self.probs.shape[0]
+        dx = np.zeros_like(self.probs)
+
+        dx[np.arange(B), self.labels] = -1 / (self.probs[np.arange(B), self.labels] + self.eps)
+        dx /= B
+
+        return dx
+
+
+# layer
+class Dropout(Mod):
+    def __init__(self, dropout_ratio=0.5):
+        super().__init__()
+        self.d_prop = dropout_ratio
+        self.mask = None
+
+    def fwd(self, x, train_flg=True):
+        if train_flg:
+            self.mask = np.random.rand(*x.shape) > self.d_prop
+            return x * self.mask
+        else:
+            return x * (1.0 - self.d_prop)
+
+    def bwd(self, dl):
+        return dl * self.mask
+
+
+class RMSNorm(Mod):
+    def __init__(self, feature_dim, eps=1e-8):
+        super().__init__()
+        self.dim = feature_dim
+        self.eps = eps
+        self.r = Parameter(1, self.dim, init='ones')
+        self.rms = None
+        self.x_hat = None
+
+    def fwd(self, x): # x shape: [..., F]
+        self.rms = np.sqrt(np.mean(x**2, axis=-1, keepdims=True) + self.eps)
+        self.x_hat = x / self.rms
+        return self.x_hat * self.r.mat # broadcasting
+
+    def bwd(self, dl):
+        self.r.grad = np.sum(dl * self.x_hat, axis=tuple(range(dl.ndim - 1))).reshape(self.r.mat.shape) # dl/dy * x/rms -> [1, f], sums all but feat dim
+        dx_hat = dl * self.r.mat
+        dx = (dx_hat - self.x_hat * np.mean(dx_hat * self.x_hat, axis=-1, keepdims=True)) / self.rms
+        return dx
+
+
+class LayerNorm(Mod):
+    def __init__(self, dim, eps=1e-5):
+        super().__init__()
+        self.eps = eps
+        self.x = None
+        self.var = None
+        self.sqvar = None
+        self.mean = None
+        self.w = Parameter(1, dim, init='ones')
+        self.b = Parameter(1, dim, init='zeros')
+
+        #self.mul = Matmul()
+        self.add = opr.Matadd()
+
+    def fwd(self, x):
+        self.x = x
+        self.mean = np.mean(x, axis=-1, keepdims=True)
+        self.var = np.var(x, axis=-1, keepdims=True)
+        self.sqvar = np.sqrt(self.var+self.eps)
+        return self.add.fwd((self.w.mat * (x-self.mean)/self.sqvar), self.b.mat)
+
+    def bwd(self, dl): # dl/dx = dl/dy * dy/dx where dy/dx = (w/(N*sqrt(var)))*(N-1-((x-mean)^2)/var)
+        N = self.x.shape[-1]
+        dl, db = self.add.bwd(dl)
+
+        #dx, dw = self.mul.bwd(dl)
+        dw = np.sum(dl * (self.x-self.mean)/self.sqvar, axis=tuple(range(len(dl.shape) - 1)), keepdims=True)
+
+        dw = dw.reshape(self.w.mat.shape)  # (1, dim)
+        db = db.reshape(self.b.mat.shape)  # (1, dim)
+
+        if self.w.grad is None:
+            self.w.grad = dw
+        else:
+            self.w.grad += dw
+        if self.b is not None:
+            if self.b.grad is None:
+                self.b.grad = db
+            else:
+                self.b.grad += db
+        dx = dl * (self.w.mat/(N*self.sqvar)) * (N-1-(np.square(self.x-self.mean))/self.var)
+        #print(f"w:{self.w.shape}, b:{self.b.shape}, x:{self.x.shape}, db:{db.shape}, dw:{dw.shape}, dx:{dx.shape}")
+        return dx
+
+
+class Linear(Mod):
+    def __init__(self, in_dim, out_dim, bias=True, dtype=np.float32, requires_grad=True):
+        super().__init__()
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+        self.w = Parameter(in_dim, out_dim, dtype=dtype, requires_grad=requires_grad)
+        if bias:
+            self.b = Parameter(1, out_dim, dtype=dtype, requires_grad=requires_grad)
+        else:
+            self.b = None
+
+        self.req_grad = requires_grad
+        self.mul = opr.Matmul()
+        self.add = opr.Matadd()
+
+    def fwd(self, x):
+        y = self.mul.fwd(x, self.w.mat)  # x @ W
+        if self.b is not None:
+            y = self.add.fwd(y, self.b.mat) # + b
+        return y
+
+    def bwd(self, dl):
+        if self.b is not None:
+            dl, db = self.add.bwd(dl)
+        dx, dw = self.mul.bwd(dl)
+        if self.req_grad:
+            if self.w.grad is None:
+                self.w.grad = dw
+            else:
+                self.w.grad += dw
+            if self.b is not None:
+                if self.b.grad is None:
+                    self.b.grad = db
+                else:
+                    self.b.grad += db
+        return dx
+
+
+def im2col(x, out_h, out_w, FH, FW, stride=1): # trans - 2dim
+    N, _, H, W = x.shape # x: [N, C, H, W]
+    cols = []
+    for i in range(0, H - FH + 1, stride): # height -> move by stride
+        for j in range(0, W - FW + 1, stride): # width -> stride
+            col = x[:, :, i:i+FH, j:j+FW].reshape(N, -1)  # patch -> [N, C*FH*FW]
+            cols.append(col) # list
+    cols = np.stack(cols, axis=1)  # [N, out_h*out_w, C*FH*FW]
+    cols = cols.reshape(N*out_h*out_w, -1)  # 'linear-like' -> [N*out_h*out_w, C*FH*FW]
+    return cols
+
+
+def col2im(cols, x_shape, out_h, out_w, FH, FW, stride=1): # restore - dl/dx -> shape [N,C,H,W]
+    N, C, H, W = x_shape
+    cols = cols.reshape(N, out_h*out_w, -1)  # [N, out_h*out_w, C*FH*FW]
+    x = np.zeros(x_shape, dtype=cols.dtype)
+    crt = 0 # current pos index for sliding window
+    for i in range(0, H - FH + 1, stride):
+        for j in range(0, W - FW + 1, stride):
+            x[:, :, i:i+FH, j:j+FW] += cols[:, crt, :].reshape(N, C, FH, FW)
+            crt += 1
+    return x
+
+
+class Conv2D(Mod):
+    def __init__(self, in_dim, out_dim, *kernel_dim, stride=1, pad=0, bias=True, dtype=np.float32, requires_grad=True):
+        super().__init__()
+        if len(kernel_dim) == 1:
+            self.fh = kernel_dim[0]
+            self.fw = kernel_dim[0]
+        elif len(kernel_dim) == 2:
+            self.fh, self.fw = kernel_dim
+        self.in_dim = in_dim # ch
+        self.out_dim = out_dim # flt
+        # input[c h w] * w[c fh fw] = [fn oh ow] ([1 oh ow] -> iter fn)
+        self.w = Parameter(in_dim, self.fh, self.fw, out_dim, dtype=dtype, requires_grad=requires_grad) #-! PARAM
+        if bias:
+            self.b = Parameter(1, out_dim, dtype=dtype, requires_grad=requires_grad)
+        else:
+            self.b = None
+        self.stride = stride
+        self.pad = pad
+        self.req_grad = requires_grad
+        self.mul = opr.Matmul()
+        self.add = opr.Matadd()
+
+        self.xp_shape = None # x_pad.shape
+        self.oh = None
+        self.ow = None
+
+    def fwd(self, x):
+        B, C, H, W = x.shape # x: [N, C, H, W]
+        x_pad = np.pad(x, ( (0, 0), (0, 0), (self.pad, self.pad), (self.pad, self.pad) ), mode='constant', constant_values=0) # padding
+        self.xp_shape = x_pad.shape
+
+        self.oh = (H + 2 * self.pad - self.fh) // self.stride + 1 # out_h = (H - FH) // stride + 1
+        self.ow = (W + 2 * self.pad - self.fw) // self.stride + 1
+
+        x_col = im2col(x_pad, self.oh, self.ow, self.fh, self.fw, self.stride)  # [N * oh * ow, C * fh * fw] # im2col trans
+        w_col = self.w.mat.reshape(-1, self.out_dim)  # [C*fh*fw, out_dim] # weight reshape
+        y = self.mul.fwd(x_col, w_col)  # [N*out_h*out_w, out_dim] # conv via matmul
+        if self.b is not None: # bias
+            y = self.add.fwd(y, self.b.mat)  # broadcast
+        y = y.reshape(B, self.oh, self.ow, self.out_dim).transpose(0, 3, 1, 2)  # reshape back to [N, out_dim, out_h, out_w]
+        return y
+
+    def bwd(self, dl):
+        B, _, out_h, out_w = dl.shape # dl: [N, C, out_h, out_w]
+        dl = dl.transpose(0, 2, 3, 1).reshape(-1, self.out_dim) # reshape dl to [N*out_h*out_w, out_dim]
+        if self.b is not None:
+            dl, db = self.add.bwd(dl)
+        dx, dw = self.mul.bwd(dl)
+        dw = dw.reshape(self.w.mat.shape)
+        if self.req_grad:
+            if self.w.grad is None:
+                self.w.grad = dw
+            else:
+                self.w.grad += dw
+            if self.b is not None:
+                if self.b.grad is None:
+                    self.b.grad = db
+                else:
+                    self.b.grad += db
+        dx = col2im(dx, self.xp_shape, self.oh, self.ow, self.fh, self.fw, self.stride)  # dx reshape using col2im, restores to x_pad_shape
+        if self.pad > 0:
+            dx = dx[:, :, self.pad:-self.pad, self.pad:-self.pad] # back to pre-padding
+        return dx
+
+
+class Transformer(Mod): # transformer block
+    def __init__(self, d_model, num_heads, d_ffn, bias=True, dtype=np.float32, requires_grad=True):
+        super().__init__()
+        self.mha = MHA(d_model, num_heads, bias=bias, dtype=dtype, requires_grad=requires_grad)
+        self.norm1 = LayerNorm(d_model)
+        self.norm2 = LayerNorm(d_model)
+        self.ffn = FFN(d_model, d_ffn, bias=bias, dtype=dtype, requires_grad=requires_grad)
+
+        self.add1 = opr.Matadd()
+        self.add2 = opr.Matadd()
+
+    def fwd(self, x, mask=None):
+        attn = self.mha.fwd(x, mask)
+        rsd1 = self.add1.fwd(x, attn)
+
+        y = self.norm1.fwd(rsd1)
+        y_ffn = self.ffn.fwd(y)
+
+        rsd2 = self.add2.fwd(y, y_ffn)
+        z = self.norm2.fwd(rsd2)
+        return z
+
+    def bwd(self, dl):
+        dl = self.norm2.bwd(dl)
+        dy_rsd2, dff = self.add2.bwd(dl)
+
+        dy_ffn = self.ffn.bwd(dff)
+        dy = dy_rsd2 + dy_ffn
+        dy = self.norm1.bwd(dy)
+
+        dx_rsd1, dattn = self.add1.bwd(dy)
+        dx_attn = self.mha.bwd(dattn)
+
+        dx = dx_rsd1 + dx_attn
+        return dx
+
+
+class MHA(Mod):
+    def __init__(self, d_model, num_heads=2, bias=True, dtype=np.float32, requires_grad=True):
+        super().__init__()
+        assert d_model % num_heads == 0
+        self.d_model = d_model
+        self.h = num_heads
+        self.d_head = d_model // num_heads
+
+        self.Wq = Linear(d_model, d_model, bias=bias, dtype=dtype, requires_grad=requires_grad)
+        self.Wk = Linear(d_model, d_model, bias=bias, dtype=dtype, requires_grad=requires_grad)
+        self.Wv = Linear(d_model, d_model, bias=bias, dtype=dtype, requires_grad=requires_grad)
+        self.Wo = Linear(d_model, d_model, bias=bias, dtype=dtype, requires_grad=requires_grad)
+
+        self.softmax = Softmax()
+
+        self.q = None
+        self.k = None
+        self.v = None
+        self.attn = None
+        self.scale = self.d_head ** 0.5
+
+        self.mul_qk = opr.Matmul()
+        self.mul_av = opr.Matmul()
+
+    def hd_split(self, x):
+        B, T, C = x.shape
+        x = x.reshape(B, T, self.h, self.d_head)
+        return x.transpose(0, 2, 1, 3)  # (B, h, T, d_head)
+
+    def hd_combine(self, x):
+        B, h, T, d = x.shape
+        x = x.transpose(0, 2, 1, 3)
+        return x.reshape(B, T, h * d)
+
+    def fwd(self, x, mask=None):
+        q = self.Wq.fwd(x)
+        k = self.Wk.fwd(x)
+        v = self.Wv.fwd(x)
+
+        self.q = self.hd_split(q)
+        self.k = self.hd_split(k)
+        self.v = self.hd_split(v)
+
+        score = self.mul_qk.fwd(self.q, self.k.transpose(0, 1, 3, 2))
+        score = score / self.scale
+        if mask is not None:
+            score += mask
+
+        self.attn = self.softmax.fwd(score)
+
+        out = self.mul_av.fwd(self.attn, self.v)
+        out = self.hd_combine(out)
+        out = self.Wo.fwd(out)
+
+        return out
+
+    def bwd(self, dl):
+        do = self.Wo.bwd(dl)
+        do = self.hd_split(do)
+
+        dattn, dv = self.mul_av.bwd(do)
+
+        dscore = self.softmax.bwd(dattn)
+        dscore /= self.scale
+
+        dq, dkt = self.mul_qk.bwd(dscore)
+        dk = dkt.transpose(0, 1, 3, 2)
+
+        dq = self.hd_combine(dq)
+        dk = self.hd_combine(dk)
+        dv = self.hd_combine(dv)
+
+        dx = self.Wq.bwd(dq)
+        dx += self.Wk.bwd(dk)
+        dx += self.Wv.bwd(dv)
+
+        return dx
+
+class FFN(Mod):
+    def __init__(self, dim, h_dim, bias=True, dtype=np.float32, requires_grad=True):
+        super().__init__()
+        self.bias = bias
+        self.dtype = dtype
+        self.requires_grad = requires_grad
+        self.in_dim = dim
+        self.h_dim = h_dim
+        self.layers = ModList(
+            Linear(self.in_dim, self.h_dim, bias=bias, dtype=dtype, requires_grad=requires_grad),
+            Relu(),
+            Linear(self.h_dim, self.in_dim, bias=bias, dtype=dtype, requires_grad=requires_grad)
+        )
+
+    def fwd(self, x): # forward
+        for layer in self.layers:
+            x = layer.fwd(x)
+        return x
+
+    def bwd(self, dl): # backward
+        for layer in reversed(self.layers):
+            dl = layer.bwd(dl)
+        return dl
+
+
+# Transform
+class Transpose(Mod):
+    def __init__(self, *axis):
+        super().__init__()
+        self.new = axis # tuple
+        self.old = [0] * len(self.new)
+        for i, a in enumerate(self.new):  # index inversion
+            self.old[a] = i
+
+    def fwd(self, x):
+        return x.transpose(self.new)
+
+    def bwd(self, dl):
+        return dl.transpose(self.old)
+
+
+class Reshape(Mod):
+    def __init__(self, *shape):
+        super().__init__()
+        self.new = list(shape) # tuple
+        self.old = None
+
+    def fwd(self, x):
+        self.old = x.shape
+        #return x.reshape(*self.new)
+        tmp = self.new.copy()
+        if -1 in tmp:
+            idx = tmp.index(-1)
+            neg = 1
+            for d in tmp:
+                if d != -1:
+                    neg *= d
+            tmp[idx] = int(np.prod(self.old)/neg)
+        return x.reshape(tmp)
+
+    def bwd(self, dl):
+        return dl.reshape(self.old)
+
+

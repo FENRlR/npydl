@@ -1,7 +1,7 @@
 # npydl
-Deep learning framework using numpy only
+Simple deep learning framework using numpy only
 
 ## Examples
-[Simple MLP](./mlp.py)
+[MLP](./mlp.py)
 
 [Transformer](./transformer.py)
